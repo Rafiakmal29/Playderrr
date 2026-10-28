@@ -1,0 +1,371 @@
+// CanvasArtworkPlayer.kt
+
+package com.playder.ui.player
+
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import com.playder.ui.utils.rememberSettled
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.Player
+import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
+import androidx.media3.datasource.cache.SimpleCache
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.ui.AspectRatioFrameLayout
+import com.music.innertube.YouTube
+import com.music.innertube.models.YouTubeClient
+import okhttp3.OkHttpClient
+import java.util.Locale
+import android.content.Context
+import android.graphics.SurfaceTexture
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
+import android.view.Surface
+import android.view.ViewGroup
+import android.view.TextureView
+import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+
+private object CanvasVideoCache {
+    @Volatile private var cache: SimpleCache? = null
+
+    fun get(context: Context): SimpleCache =
+        cache ?: synchronized(this) {
+            cache ?: SimpleCache(
+                java.io.File(context.cacheDir, "canvas_video"),
+                LeastRecentlyUsedCacheEvictor(300L * 1024 * 1024),
+                StandaloneDatabaseProvider(context),
+            ).also { cache = it }
+        }
+}
+
+/** how long a canvas has to stay before its video starts */
+private const val CanvasSettleMs = 700L
+
+@Composable
+fun CanvasArtworkPlayer(
+    primaryUrl: String?,
+    fallbackUrl: String?,
+    isPlaying: Boolean,
+    modifier: Modifier = Modifier,
+    blurRadiusPx: Float = 0f,
+) {
+    val context = LocalContext.current
+    val primary = primaryUrl?.takeIf { it.isNotBlank() }
+    val fallback = fallbackUrl?.takeIf { it.isNotBlank() }
+    // like the video background: no decoder for each canvas skipped past, only once it has stayed
+    val initial = rememberSettled(primary ?: fallback ?: return, CanvasSettleMs) ?: return
+    var currentUrl by remember(initial) { mutableStateOf(initial) }
+    var isVideoReady by remember(initial) { mutableStateOf(false) }
+
+    val okHttpClient =
+        remember {
+            OkHttpClient
+                .Builder()
+                .proxy(YouTube.proxy)
+                .addInterceptor { chain ->
+                    val request = chain.request()
+                    val host = request.url.host
+                    val isYouTubeMediaHost =
+                        host.endsWith("googlevideo.com") ||
+                            host.endsWith("googleusercontent.com") ||
+                            host.endsWith("youtube.com") ||
+                            host.endsWith("youtube-nocookie.com") ||
+                            host.endsWith("ytimg.com")
+
+                    if (!isYouTubeMediaHost) return@addInterceptor chain.proceed(request)
+
+                    val clientParam = request.url.queryParameter("c")?.trim().orEmpty()
+                    val isWeb =
+                        clientParam.startsWith("WEB", ignoreCase = true) ||
+                            clientParam.startsWith("WEB_REMIX", ignoreCase = true) ||
+                            request.url.toString().contains("c=WEB", ignoreCase = true)
+
+                    val userAgent =
+                        when {
+                            clientParam.startsWith("WEB", ignoreCase = true) ||
+                                clientParam.startsWith("WEB_REMIX", ignoreCase = true) -> YouTubeClient.USER_AGENT_WEB
+
+                            clientParam.startsWith("IOS", ignoreCase = true) -> YouTubeClient.IOS.userAgent
+
+                            clientParam.startsWith("ANDROID_VR", ignoreCase = true) -> YouTubeClient.ANDROID_VR_NO_AUTH.userAgent
+
+                            clientParam.startsWith("ANDROID", ignoreCase = true) -> YouTubeClient.MOBILE.userAgent
+
+                            else -> YouTubeClient.USER_AGENT_WEB
+                        }
+
+                    val builder = request.newBuilder().header("User-Agent", userAgent)
+                    if (isWeb) {
+                        builder.header("Origin", YouTubeClient.ORIGIN_YOUTUBE_MUSIC)
+                        builder.header("Referer", YouTubeClient.REFERER_YOUTUBE_MUSIC)
+                    }
+
+                    chain.proceed(builder.build())
+                }
+                .build()
+        }
+    val mediaSourceFactory =
+        remember(okHttpClient) {
+            val upstreamFactory = DefaultDataSource.Factory(
+                context,
+                OkHttpDataSource.Factory(okHttpClient),
+            )
+            val cacheDataSourceFactory = CacheDataSource.Factory()
+                .setCache(CanvasVideoCache.get(context.applicationContext))
+                .setUpstreamDataSourceFactory(upstreamFactory)
+                .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+            DefaultMediaSourceFactory(cacheDataSourceFactory)
+        }
+    val aspectRatioFrameLayout = remember {
+        AspectRatioFrameLayout(context).apply {
+            layoutParams = ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+            setBackgroundColor(android.graphics.Color.TRANSPARENT)
+        }
+    }
+    // the texture outlives a session, so a new url's player draws into the same view
+    val texture = remember { CanvasTexture() }
+    val session = remember(initial) {
+        CanvasVideoSession(context, mediaSourceFactory, isPlaying).also { texture.session = it }
+    }
+
+    LaunchedEffect(isPlaying) {
+        session.setPlaying(isPlaying)
+    }
+
+    DisposableEffect(session, primary, fallback) {
+        val listener =
+            object : Player.Listener {
+                override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                    val next =
+                        when (currentUrl) {
+                            primary -> fallback
+                            else -> null
+                        }
+                    if (!next.isNullOrBlank()) {
+                        currentUrl = next
+                        isVideoReady = false
+                    }
+                }
+
+                override fun onRenderedFirstFrame() {
+                    isVideoReady = true
+                }
+
+                override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                    if (videoSize.width > 0 && videoSize.height > 0) {
+                        // callbacks land on the canvas thread, but the view only takes changes on the main one
+                        aspectRatioFrameLayout.post {
+                            aspectRatioFrameLayout.setAspectRatio(videoSize.width.toFloat() / videoSize.height)
+                        }
+                    }
+                }
+            }
+        session.addListener(listener)
+        onDispose { session.removeListener(listener) }
+    }
+
+    LaunchedEffect(currentUrl, session) {
+        val normalized = currentUrl.trim()
+        val mimeType =
+            when {
+                normalized.contains(".m3u8", ignoreCase = true) ||
+                normalized.lowercase(Locale.ROOT).split('?').first().endsWith(".m3u8") -> MimeTypes.APPLICATION_M3U8
+                normalized.lowercase(Locale.ROOT).contains(".mp4") -> MimeTypes.VIDEO_MP4
+                primary != null && currentUrl == primary -> {
+
+                    if (normalized.contains("apple.com") || normalized.contains("music.apple") || !normalized.contains(".mp4")) {
+                        MimeTypes.APPLICATION_M3U8
+                    } else {
+                        MimeTypes.VIDEO_MP4
+                    }
+                }
+                fallback != null && currentUrl == fallback -> MimeTypes.VIDEO_MP4
+                else -> MimeTypes.APPLICATION_M3U8
+            }
+
+        val mediaItem =
+            MediaItem.Builder()
+                .setUri(normalized)
+                .setMimeType(mimeType)
+                .build()
+
+        isVideoReady = false
+        session.load(mediaItem, isPlaying)
+    }
+
+    DisposableEffect(session) {
+        onDispose {
+            session.release()
+        }
+    }
+
+    val alpha by animateFloatAsState(
+        targetValue = if (isVideoReady) 1f else 0f,
+        animationSpec = tween(durationMillis = 300),
+        label = "canvasAlpha"
+    )
+
+    AndroidView(
+        factory = { viewContext ->
+            aspectRatioFrameLayout.apply {
+                if (childCount == 0) {
+                val textureView = TextureView(viewContext).apply {
+                    layoutParams = ViewGroup.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+                    surfaceTextureListener = texture
+                }
+                addView(textureView)
+                }
+            }
+        },
+        update = { view ->
+
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                view.setRenderEffect(
+                    com.playder.ui.component.BlurEffectCache.getNative(
+                        blurRadiusPx,
+                        android.graphics.Shader.TileMode.CLAMP
+                    )
+                )
+            }
+        },
+        modifier = modifier.alpha(alpha),
+    )
+}
+
+// one thread runs every canvas player, so building or releasing one never stalls the main thread mid-scroll
+private object CanvasVideoThread {
+    val handler: Handler by lazy { Handler(HandlerThread("CanvasVideo").apply { start() }.looper) }
+}
+
+// one canvas video's player, touched only on the canvas thread; the main thread just posts to it
+private class CanvasVideoSession(
+    context: Context,
+    mediaSourceFactory: MediaSource.Factory,
+    playing: Boolean,
+) {
+    private val handler = CanvasVideoThread.handler
+    private var player: ExoPlayer? = null
+    private var surface: Surface? = null
+
+    init {
+        handler.post {
+            player = ExoPlayer.Builder(context)
+                .setLooper(handler.looper)
+                .setMediaSourceFactory(mediaSourceFactory)
+                .build()
+                .apply {
+                    trackSelectionParameters = trackSelectionParameters
+                        .buildUpon()
+                        .setMaxVideoSize(1280, 1280)
+                        .setMaxVideoBitrate(2_500_000)
+                        .setForceHighestSupportedBitrate(false)
+                        .build()
+                    setAudioAttributes(
+                        AudioAttributes
+                            .Builder()
+                            .setUsage(C.USAGE_MEDIA)
+                            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                            .build(),
+                        false,
+                    )
+                    volume = 0f
+                    repeatMode = Player.REPEAT_MODE_ONE
+                    videoScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
+                    playWhenReady = playing
+                    surface?.let(::setVideoSurface)
+                }
+        }
+    }
+
+    fun setPlaying(playing: Boolean) = handler.post {
+        player?.let { if (it.playWhenReady != playing) it.playWhenReady = playing }
+    }
+
+    fun addListener(listener: Player.Listener) = handler.post { player?.addListener(listener) }
+
+    fun removeListener(listener: Player.Listener) = handler.post { player?.removeListener(listener) }
+
+    fun load(mediaItem: MediaItem, playing: Boolean) = handler.post {
+        player?.apply {
+            stop()
+            setMediaItem(mediaItem)
+            prepare()
+            playWhenReady = playing
+        }
+    }
+
+    fun attach(texture: SurfaceTexture) = handler.post {
+        surface?.release()
+        surface = Surface(texture).also { player?.setVideoSurface(it) }
+    }
+
+    // waits here, off the main thread, until the decoder lets go of the texture, then hands it back to be freed
+    fun detach(texture: SurfaceTexture) = handler.post {
+        surface?.let { player?.clearVideoSurface(it) }
+        surface?.release()
+        surface = null
+        mainHandler.post { texture.release() }
+    }
+
+    fun release() = handler.post {
+        player?.release()
+        player = null
+        surface?.release()
+        surface = null
+    }
+
+    private companion object {
+        val mainHandler = Handler(Looper.getMainLooper())
+    }
+}
+
+// keeps the view's texture alive until the canvas thread is done with it, and gives it to whichever session is current
+private class CanvasTexture : TextureView.SurfaceTextureListener {
+    private var available: SurfaceTexture? = null
+
+    var session: CanvasVideoSession? = null
+        set(value) {
+            field = value
+            available?.let { value?.attach(it) }
+        }
+
+    override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+        available = texture
+        session?.attach(texture)
+    }
+
+    override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+        available = null
+        val current = session
+        if (current == null) return true
+        current.detach(texture)
+        // false: the texture is freed after the decoder lets go of it, not while it still draws into it
+        return false
+    }
+
+    override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
+
+    override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
+}

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="home">Utama</string>
+    <string name="music">Muzik</string>
+    <string name="songs">Lagu</string>
+    <string name="artists">Artis</string>
+    <string name="albums">Album</string>
+    <string name="playlists">Senarai main</string>
+    <string name="search">Cari</string>
+    <string name="history">Sejarah</string>
+    <string name="stats">Statistik</string>
+    <string name="account">Akaun</string>
+    <string name="today">Hari ini</string>
+    <string name="yesterday">Semalam</string>
+</resources>
