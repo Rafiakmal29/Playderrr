@@ -1,4 +1,4 @@
-<img width="1799" height="927" alt="Frame 286" src="https://github.com/user-attachments/assets/e793be23-be42-4b16-aa0d-bd8656026ecb" />
+
 
 <div align="center">
 
