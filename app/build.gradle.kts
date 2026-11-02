@@ -27,8 +27,8 @@ extensions.configure<ApplicationExtension> {
         applicationId = "com.playder"
         minSdk = 24
         targetSdk = 36
-        versionCode = 74
-        versionName = "2.4.4"
+        versionCode = 75
+        versionName = "2.4.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
